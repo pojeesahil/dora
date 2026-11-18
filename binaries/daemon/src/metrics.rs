@@ -29,6 +29,7 @@ pub(crate) const MIN_METRICS_WINDOW_SECS: f64 = 0.1;
 pub(crate) struct NodeSnapshot {
     node_id: NodeId,
     pid: Option<Arc<AtomicU32>>,
+    spawned_at: Arc<AtomicU64>,
     restart_count: Arc<AtomicU32>,
     restarts_disabled: bool,
     broken_inputs: Vec<String>,
@@ -313,6 +314,106 @@ pub(crate) fn bounded_descendants_for_exited_root(
     found
 }
 
+/// Compute metrics for the nodes of a single dataflow.
+pub(crate) fn compute_dataflow_node_metrics(
+    nodes: &[NodeSnapshot],
+    sys: Option<&sysinfo::System>,
+    previous_processes: &HashMap<sysinfo::Pid, u64>,
+    refresh_window: Option<Duration>,
+) -> BTreeMap<NodeId, dora_message::daemon_to_coordinator::NodeMetrics> {
+    use dora_message::daemon_to_coordinator::{NodeMetrics, NodeStatus};
+    use sysinfo::Pid;
+
+    let mut metrics = BTreeMap::new();
+
+    if let Some(sys) = sys {
+        let children_map = child_process_map(sys);
+
+        for node in nodes {
+            let spawned_at = node.spawned_at.load(atomic::Ordering::Acquire);
+            if spawned_at == 0 {
+                // Node has exited / in restart backoff; not currently running.
+                continue;
+            }
+            if let Some(pid_arc) = node.pid.as_ref() {
+                let pid = pid_arc.load(atomic::Ordering::Acquire);
+                if pid == 0 {
+                    continue;
+                }
+                let sys_pid = Pid::from_u32(pid);
+                let Some(proc) = sys.process(sys_pid) else {
+                    continue;
+                };
+                let proc_start = proc.start_time();
+                let spawned_at_secs = spawned_at / 1000;
+                // Guard against PID reuse: an unrelated process at this PID that
+                // started before this node was spawned is a recycled stranger.
+                if proc_start != 0
+                    && spawned_at_secs > 1_000_000
+                    && proc_start < spawned_at_secs.saturating_sub(1)
+                {
+                    continue;
+                }
+                if let Some((cpu_usage, memory_bytes, disk)) =
+                    aggregate_process_tree(sys, &children_map, previous_processes, sys_pid)
+                {
+                    let disk_window = disk.window(refresh_window);
+
+                    let restart_count = node.restart_count.load(atomic::Ordering::Acquire);
+                    let status = if !node.broken_inputs.is_empty() {
+                        NodeStatus::Degraded
+                    } else {
+                        NodeStatus::Running
+                    };
+
+                    metrics.insert(
+                        node.node_id.clone(),
+                        NodeMetrics {
+                            pid,
+                            cpu_usage,
+                            memory_bytes,
+                            disk_read_bytes: disk_rate_bytes_per_sec(disk.read, disk_window),
+                            disk_write_bytes: disk_rate_bytes_per_sec(disk.written, disk_window),
+                            restart_count,
+                            broken_inputs: node.broken_inputs.clone(),
+                            status,
+                            pending_messages: node.pending_messages,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    // Second pass: report nodes without a running process.
+    for node in nodes {
+        if !metrics.contains_key(&node.node_id) {
+            let restart_count = node.restart_count.load(atomic::Ordering::Acquire);
+            let status = if node.restarts_disabled {
+                NodeStatus::Failed
+            } else {
+                NodeStatus::Restarting
+            };
+            metrics.insert(
+                node.node_id.clone(),
+                NodeMetrics {
+                    pid: 0,
+                    cpu_usage: 0.0,
+                    memory_bytes: 0,
+                    disk_read_bytes: None,
+                    disk_write_bytes: None,
+                    restart_count,
+                    broken_inputs: node.broken_inputs.clone(),
+                    status,
+                    pending_messages: node.pending_messages,
+                },
+            );
+        }
+    }
+
+    metrics
+}
+
 /// Collect and send metrics in the background. Errors are returned to the
 /// caller (the spawned task logs them).
 pub(crate) async fn collect_and_send_metrics_bg(
@@ -322,12 +423,13 @@ pub(crate) async fn collect_and_send_metrics_bg(
     daemon_id: DaemonId,
     clock: Arc<uhlc::HLC>,
 ) -> eyre::Result<()> {
-    use dora_message::daemon_to_coordinator::NodeMetrics;
-    use sysinfo::{Pid, ProcessesToUpdate};
+    use sysinfo::ProcessesToUpdate;
 
-    let has_any_running = dataflows
-        .iter()
-        .any(|df| df.nodes.iter().any(|n| n.pid.is_some()));
+    let has_any_running = dataflows.iter().any(|df| {
+        df.nodes
+            .iter()
+            .any(|n| n.pid.is_some() && n.spawned_at.load(atomic::Ordering::Acquire) != 0)
+    });
 
     // Refresh sysinfo on a blocking thread if any nodes are running. The owned
     // guard is held for the whole collection, so a tick that lands while the
@@ -393,78 +495,12 @@ pub(crate) async fn collect_and_send_metrics_bg(
     };
 
     for df in &dataflows {
-        let mut metrics = BTreeMap::new();
-
-        if let Some(state) = &refreshed_state {
-            let sys = &state.system;
-            // Pre-build parent->children map once per refresh.
-            let children_map = child_process_map(sys);
-
-            for node in &df.nodes {
-                if let Some(pid_arc) = node.pid.as_ref() {
-                    let pid = pid_arc.load(atomic::Ordering::Acquire);
-                    let sys_pid = Pid::from_u32(pid);
-                    if let Some((cpu_usage, memory_bytes, disk)) =
-                        aggregate_process_tree(sys, &children_map, &previous_processes, sys_pid)
-                    {
-                        let disk_window = disk.window(refresh_window);
-
-                        let restart_count = node.restart_count.load(atomic::Ordering::Acquire);
-                        let status = if !node.broken_inputs.is_empty() {
-                            dora_message::daemon_to_coordinator::NodeStatus::Degraded
-                        } else {
-                            dora_message::daemon_to_coordinator::NodeStatus::Running
-                        };
-
-                        metrics.insert(
-                            node.node_id.clone(),
-                            NodeMetrics {
-                                pid,
-                                cpu_usage,
-                                memory_bytes,
-                                disk_read_bytes: disk_rate_bytes_per_sec(disk.read, disk_window),
-                                disk_write_bytes: disk_rate_bytes_per_sec(
-                                    disk.written,
-                                    disk_window,
-                                ),
-                                restart_count,
-                                broken_inputs: node.broken_inputs.clone(),
-                                status,
-                                pending_messages: node.pending_messages,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-
-        // Second pass: report nodes without a running process.
-        for node in &df.nodes {
-            if !metrics.contains_key(&node.node_id) {
-                let restart_count = node.restart_count.load(atomic::Ordering::Acquire);
-                let status = if node.restarts_disabled {
-                    dora_message::daemon_to_coordinator::NodeStatus::Failed
-                } else if restart_count > 0 {
-                    dora_message::daemon_to_coordinator::NodeStatus::Restarting
-                } else {
-                    continue;
-                };
-                metrics.insert(
-                    node.node_id.clone(),
-                    NodeMetrics {
-                        pid: 0,
-                        cpu_usage: 0.0,
-                        memory_bytes: 0,
-                        disk_read_bytes: None,
-                        disk_write_bytes: None,
-                        restart_count,
-                        broken_inputs: Vec::new(),
-                        status,
-                        pending_messages: node.pending_messages,
-                    },
-                );
-            }
-        }
+        let metrics = compute_dataflow_node_metrics(
+            &df.nodes,
+            refreshed_state.as_ref().map(|s| &s.system),
+            &previous_processes,
+            refresh_window,
+        );
 
         if !metrics.is_empty() {
             let network = {
@@ -547,6 +583,7 @@ impl Daemon {
                     .map(|(nid, rn)| NodeSnapshot {
                         node_id: nid.clone(),
                         pid: rn.pid.clone(),
+                        spawned_at: rn.spawned_at.clone(),
                         restart_count: rn.restart_count.clone(),
                         restarts_disabled: rn.restarts_disabled(),
                         broken_inputs: df
@@ -675,6 +712,7 @@ mod disk_rate_tests {
                 nodes: vec![NodeSnapshot {
                     node_id: NodeId::from("node".to_string()),
                     pid: Some(Arc::new(AtomicU32::new(std::process::id()))),
+                    spawned_at: Arc::new(AtomicU64::new(1)),
                     restart_count: Arc::default(),
                     restarts_disabled: false,
                     broken_inputs: Vec::new(),
@@ -1052,5 +1090,149 @@ mod process_tree_tests {
             memory_bytes, own_memory,
             "a single-threaded node must be counted exactly once"
         );
+    }
+}
+
+#[cfg(test)]
+mod restart_backoff_tests {
+    use super::*;
+    use dora_message::daemon_to_coordinator::NodeStatus;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
+
+    fn refreshed_system_with_own_process() -> (sysinfo::System, u32) {
+        let own_pid = std::process::id();
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(own_pid)]),
+            true,
+            metrics_refresh_kind(),
+        );
+        (sys, own_pid)
+    }
+
+    /// Regression test for #4196:
+    /// When a node process exits and enters restart backoff, its shared `pid`
+    /// atomic still holds the exited process's PID while `spawned_at` is reset to 0.
+    /// If the OS reuses that PID for an unrelated process, the metrics sampler
+    /// must NOT aggregate that stranger process or report the node as `Running`.
+    ///
+    /// Furthermore, when `restart_count == 0` (before the first restart attempt),
+    /// the node must still be reported as `Restarting` rather than dropped.
+    #[test]
+    fn node_in_restart_backoff_reports_restarting_even_if_pid_points_to_live_process() {
+        let (sys, own_pid) = refreshed_system_with_own_process();
+
+        // Node whose process has exited and is sleeping in backoff:
+        // pid still points to a live process (here: own_pid), but spawned_at == 0.
+        let node = NodeSnapshot {
+            node_id: NodeId::from("crashed_node".to_string()),
+            pid: Some(Arc::new(AtomicU32::new(own_pid))),
+            spawned_at: Arc::new(AtomicU64::new(0)),
+            restart_count: Arc::new(AtomicU32::new(0)),
+            restarts_disabled: false,
+            broken_inputs: Vec::new(),
+            pending_messages: 0,
+        };
+
+        let metrics = compute_dataflow_node_metrics(&[node], Some(&sys), &HashMap::new(), None);
+        let reported = metrics
+            .get(&NodeId::from("crashed_node".to_string()))
+            .expect("node in backoff must be reported");
+
+        assert_eq!(
+            reported.status,
+            NodeStatus::Restarting,
+            "node in backoff must be reported as Restarting, not Running"
+        );
+        assert_eq!(reported.pid, 0, "pid must be reported as 0 during backoff");
+        assert_eq!(reported.cpu_usage, 0.0);
+        assert_eq!(reported.memory_bytes, 0);
+    }
+
+    #[test]
+    fn node_with_restarts_disabled_reports_failed() {
+        let node = NodeSnapshot {
+            node_id: NodeId::from("failed_node".to_string()),
+            pid: Some(Arc::new(AtomicU32::new(12345))),
+            spawned_at: Arc::new(AtomicU64::new(0)),
+            restart_count: Arc::new(AtomicU32::new(3)),
+            restarts_disabled: true,
+            broken_inputs: Vec::new(),
+            pending_messages: 0,
+        };
+
+        let metrics = compute_dataflow_node_metrics(&[node], None, &HashMap::new(), None);
+        let reported = metrics
+            .get(&NodeId::from("failed_node".to_string()))
+            .expect("failed node must be reported");
+
+        assert_eq!(
+            reported.status,
+            NodeStatus::Failed,
+            "node with restarts_disabled must be reported as Failed"
+        );
+        assert_eq!(reported.pid, 0);
+    }
+
+    #[test]
+    fn recycled_stranger_pid_is_not_reported_as_running() {
+        let (sys, own_pid) = refreshed_system_with_own_process();
+        let proc = sys
+            .process(sysinfo::Pid::from_u32(own_pid))
+            .expect("process exists");
+        let start_time = proc.start_time();
+        if start_time == 0 {
+            // start_time unknown on this platform; skip start_time comparison
+            return;
+        }
+
+        // Simulate a node that supposedly spawned 100 seconds AFTER own_pid started,
+        // but whose PID matches own_pid (i.e. recycled stranger).
+        let spawned_at_ms = (start_time + 100) * 1000;
+        let node = NodeSnapshot {
+            node_id: NodeId::from("recycled_node".to_string()),
+            pid: Some(Arc::new(AtomicU32::new(own_pid))),
+            spawned_at: Arc::new(AtomicU64::new(spawned_at_ms)),
+            restart_count: Arc::new(AtomicU32::new(1)),
+            restarts_disabled: false,
+            broken_inputs: Vec::new(),
+            pending_messages: 0,
+        };
+
+        let metrics = compute_dataflow_node_metrics(&[node], Some(&sys), &HashMap::new(), None);
+        let reported = metrics
+            .get(&NodeId::from("recycled_node".to_string()))
+            .expect("node must be reported");
+
+        assert_eq!(
+            reported.status,
+            NodeStatus::Restarting,
+            "recycled stranger PID must not be reported as Running"
+        );
+        assert_eq!(reported.pid, 0);
+    }
+
+    #[test]
+    fn actively_running_node_is_reported_as_running() {
+        let (sys, own_pid) = refreshed_system_with_own_process();
+
+        let node = NodeSnapshot {
+            node_id: NodeId::from("live_node".to_string()),
+            pid: Some(Arc::new(AtomicU32::new(own_pid))),
+            spawned_at: Arc::new(AtomicU64::new(1)),
+            restart_count: Arc::new(AtomicU32::new(0)),
+            restarts_disabled: false,
+            broken_inputs: Vec::new(),
+            pending_messages: 0,
+        };
+
+        let metrics = compute_dataflow_node_metrics(&[node], Some(&sys), &HashMap::new(), None);
+        let reported = metrics
+            .get(&NodeId::from("live_node".to_string()))
+            .expect("live node must be reported");
+
+        assert_eq!(reported.status, NodeStatus::Running);
+        assert_eq!(reported.pid, own_pid);
+        assert!(reported.memory_bytes > 0);
     }
 }
